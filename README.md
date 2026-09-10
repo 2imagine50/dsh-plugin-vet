@@ -73,6 +73,22 @@ The second most valuable is **the `files` list**, because it tells you how many 
 
 Exit code `0` is **not** approval. It means no heuristic fired. Read the entry file.
 
+## What it says about itself
+
+Run it on this repository and it reports **17 high-severity hits**. All of them are false positives, for an instructive reason:
+
+```
+HIGH  yaml-js-expression  dsh-plugin-vet.mjs:89   !!js
+HIGH  credential-path     dsh-plugin-vet.mjs:89   id_rsa
+HIGH  credential-path     dsh-plugin-vet.mjs:89   .git-credentials
+MED   network-egress      dsh-plugin-vet.mjs:195  fetch(
+LOW   fs-write            dsh-plugin-vet.mjs:634  rmSync(
+```
+
+Every one comes from the tool's own rule table: the regexes match their own string literals, the `!!js` hits are the pattern definitions themselves, and the `rmSync` is the scratch-directory cleanup. It also correctly reports that the entry does not export `apply`, because this is not a cordis plugin.
+
+That is the honest shape of a grep-based scan. A hit means *read this line*, not *this is malicious* — which is exactly why every hit is line-attributed. Read the lines.
+
 ## What it can't do — read this part
 
 - **It is heuristic, not definitive.** It greps for shapes. Malicious behaviour written to look like ordinary code will not be flagged. It is a triage tool that tells you where to look, not a verdict.
