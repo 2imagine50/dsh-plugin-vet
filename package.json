@@ -1,0 +1,37 @@
+{
+  "name": "dsh-plugin-vet",
+  "version": "0.1.0",
+  "description": "Vet a DeepSeek Harness (dsh) plugin straight from GitHub before installing it — without installing it or running any of its code.",
+  "type": "module",
+  "bin": {
+    "dsh-plugin-vet": "./dsh-plugin-vet.mjs"
+  },
+  "main": "./dsh-plugin-vet.mjs",
+  "exports": {
+    ".": "./dsh-plugin-vet.mjs",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dsh-plugin-vet.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node dsh-plugin-vet.mjs icyaaaww/dsh-tool-failure-circuit-breaker --json"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "supply-chain",
+    "security",
+    "audit",
+    "vet"
+  ],
+  "license": "MIT",
+  "dependencies": {}
+}

@@ -1,0 +1,6 @@
+# scratch trees written by dsh-plugin-vet when --out is not given and the OS
+# temp dir is unavailable
+.dsh-plugin-vet/
+
+node_modules/
+*.log
