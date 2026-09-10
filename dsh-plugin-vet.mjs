@@ -191,18 +191,37 @@ function parseSpec(spec) {
   return { owner: parts[0], repo: parts[1].replace(/[^\w.-]/g, ''), ref }
 }
 
+// Unauthenticated GitHub allows 60 API requests an hour, which a few runs can
+// exhaust. A read-only token in GITHUB_TOKEN (or GH_TOKEN) raises that. It is
+// only ever sent to api.github.com and codeload.github.com.
+const TOKEN = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN ?? null
+const AUTH = TOKEN ? { authorization: `Bearer ${TOKEN}` } : {}
+
 async function ghJson(path) {
   const res = await fetch(API + path, {
-    headers: { 'user-agent': UA, accept: 'application/vnd.github+json' },
+    headers: { 'user-agent': UA, accept: 'application/vnd.github+json', ...AUTH },
+    signal: AbortSignal.timeout(30_000),
   })
   if (res.status === 404) throw new Error(`not found: ${path}`)
+  if (res.status === 403 && res.headers.get('x-ratelimit-remaining') === '0') {
+    const reset = Number(res.headers.get('x-ratelimit-reset') ?? 0) * 1000
+    throw new Error(
+      'GitHub API rate limit exhausted (60/hour without a token).'
+      + (reset ? ` Resets at ${new Date(reset).toISOString()}.` : '')
+      + ' Set GITHUB_TOKEN to a read-only token to raise the limit.',
+    )
+  }
   if (!res.ok) throw new Error(`GitHub API ${path} -> ${res.status} ${res.statusText}`)
   return res.json()
 }
 
 async function downloadTarball({ owner, repo, ref }) {
   const url = `${CODELOAD}/${owner}/${repo}/tar.gz/${ref}`
-  const res = await fetch(url, { headers: { 'user-agent': UA }, redirect: 'follow' })
+  const res = await fetch(url, {
+    headers: { 'user-agent': UA, ...AUTH },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(120_000),
+  })
   if (!res.ok) throw new Error(`tarball download failed: ${res.status} ${res.statusText} (${url})`)
   return { url, buffer: Buffer.from(await res.arrayBuffer()) }
 }
@@ -234,6 +253,83 @@ function shippedPaths(paths, filesField) {
     }
   }
   return keep
+}
+
+/**
+ * Every directory holding a package.json is a package root. Monorepos are
+ * common in this ecosystem (one repo, several installable dsh plugins), and
+ * vetting only the repository root would report "the whole repo ships" for a
+ * tree whose real packages are the subdirectories.
+ */
+function discoverPackageRoots(files) {
+  const roots = []
+  for (const f of files) {
+    if (f.path !== 'package.json' && !f.path.endsWith('/package.json')) continue
+    if (f.path.split('/').includes('node_modules')) continue
+    roots.push(f.path === 'package.json' ? '' : f.path.slice(0, -'/package.json'.length))
+  }
+  return roots.sort((a, b) =>
+    a.split('/').filter(Boolean).length - b.split('/').filter(Boolean).length || a.localeCompare(b))
+}
+
+/** Turn one package's patch into the harness-policy findings worth surfacing. */
+function patchFindings(patch) {
+  if (!patch) return []
+  const out = []
+  for (const t of patch.targeted) {
+    if (!WATCH_ROWS.has(t.id)) continue
+    out.push(t.disabled
+      ? `patch disables harness row \`${t.id}\` (line ${t.line})`
+      : `patch overrides harness row \`${t.id}\` (line ${t.line})`)
+  }
+  for (const t of patch.inserted) {
+    if (t.name && WATCH_ROWS.has(t.name)) out.push(`patch inserts a row named \`${t.name}\` (line ${t.line})`)
+  }
+  if (patch.jsExpressions.length) {
+    out.push(`${patch.jsExpressions.length} !!js expression(s) evaluated at config load`)
+  }
+  return out
+}
+
+const INSTALL_SCRIPT_KEYS = ['preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublishOnly']
+
+/** Analyse one package: what it ships, how it wires into DSH, and its risk shape. */
+function analyzePackage(root, files) {
+  const prefix = root === '' ? '' : `${root}/`
+  const pkgEntry = files.find(f => f.path === `${prefix}package.json`)
+  let pkg = null
+  if (pkgEntry) { try { pkg = JSON.parse(pkgEntry.data.toString('utf8')) } catch { pkg = null } }
+
+  const members = files.filter(f => f.path.startsWith(prefix))
+  const shippedRel = pkg ? shippedPaths(members.map(f => f.path.slice(prefix.length)), pkg.files) : new Set()
+  const shipped = new Set([...shippedRel].map(p => prefix + p))
+
+  const patchRel = pkg?.dsh?.bundle?.patch ?? null
+  const patchFile = patchRel
+    ? members.find(f => f.path === `${prefix}${String(patchRel).replace(/^\.\//, '')}`)
+    : null
+  const patch = patchFile ? analyzePatch(patchFile.data.toString('utf8')) : null
+
+  const scripts = pkg?.scripts ?? {}
+  const installScripts = INSTALL_SCRIPT_KEYS
+    .filter(k => scripts[k])
+    .map(k => ({ key: k, command: String(scripts[k]) }))
+
+  let entryMissingApply = false
+  const mainRel = pkg?.main ?? (pkg?.exports?.['.'] ?? null)
+  if (typeof mainRel === 'string') {
+    const entry = members.find(f => f.path === `${prefix}${String(mainRel).replace(/^\.\//, '')}`)
+    if (entry) {
+      const src = entry.data.toString('utf8')
+      entryMissingApply = !/export\s+(?:async\s+)?(?:function|const|let|var)\s+apply\b|module\.exports\s*=\s*\{[^}]*\bapply\b/.test(src)
+    }
+  }
+
+  return {
+    root, prefix, pkg, members, shipped, patchRel, patch,
+    policyFindings: patchFindings(patch),
+    installScripts, entryMissingApply,
+  }
 }
 
 function isTextFile(path, data) {
@@ -329,66 +425,131 @@ function renderReport(r) {
   L.push(`  tarball sha256 : ${r.tarballSha}`)
   L.push(`  extracted      : ${r.fileCount} files, ${(r.totalBytes / 1024).toFixed(1)} KiB`)
 
-  L.push(section('package'))
-  if (!r.pkg) {
-    L.push('  \x1b[33mno package.json at the repository root — this is not an installable package\x1b[0m')
-  } else {
-    const p = r.pkg
-    L.push(`  name/version   : ${p.name ?? '?'} @ ${p.version ?? '?'}`)
-    L.push(`  license        : ${p.license ?? 'none declared'}`)
-    L.push(`  type           : ${p.type ?? 'commonjs'}`)
-    L.push(`  main/exports   : ${p.main ?? '-'} / ${p.exports ? JSON.stringify(p.exports).slice(0, 90) : '-'}`)
-    L.push(`  engines        : ${p.engines ? JSON.stringify(p.engines) : '-'}`)
-    L.push(`  dependencies   : ${p.dependencies ? Object.entries(p.dependencies).map(([k, v]) => `${k}@${v}`).join(', ') : 'none'}`)
-    if (r.entryMissingApply) L.push('  \x1b[33mdeclared entry does not export `apply` — not a cordis plugin\x1b[0m')
+  const multi = (r.packages?.length ?? 0) > 1
 
-    const scripts = p.scripts ?? {}
-    const risky = ['preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublishOnly'].filter(k => scripts[k])
-    L.push(`  scripts        : ${Object.keys(scripts).length ? Object.keys(scripts).join(', ') : 'none'}`)
-    if (risky.length) {
-      L.push(`  \x1b[1m\x1b[31m  ▲ install-time scripts present: ${risky.join(', ')}\x1b[0m`)
-      L.push('      pnpm >= 10 blocks dependency build scripts until you allowlist them in')
-      L.push('      pnpm-workspace.yaml (allowBuilds). Do not allowlist before reading them:')
-      for (const k of risky) L.push(`        ${k}: ${scripts[k]}`)
-    } else {
-      L.push('  install scripts: none — nothing runs at install time')
+  if (multi) {
+    L.push(section('packages'))
+    L.push(`  \x1b[1m${r.packages.length} packages in this repository\x1b[0m — each one is installed separately.`)
+    L.push('  vet them one by one; a repo-level verdict would hide which package is which.')
+    L.push('')
+    L.push('  package                  name @ version                    ships    bundle              hits')
+    L.push('  ------------------------ --------------------------------- ------- ------------------- ----------')
+    for (const p of r.packages) {
+      const label = (p.root === '' ? '.' : `${p.root}/`).padEnd(24)
+      const name = (p.hasManifest ? `${p.name ?? '?'}@${p.version ?? '?'}` : '(no package.json)').padEnd(33)
+      const ships = (p.hasManifest ? `${p.shippedCount}/${p.memberCount}` : '-').padEnd(7)
+      const bundle = (p.hasManifest ? (p.dshBundlePatch ? String(p.dshBundlePatch) : 'none') : '-').padEnd(19)
+      const hits = p.hasManifest ? `${p.hitCounts.high}H ${p.hitCounts.medium}M` : '-'
+      L.push(`  ${label} ${name} ${ships} ${bundle} ${hits}`)
+    }
+    if (!r.packages.some(p => p.root === '')) {
+      L.push('')
+      L.push('  \x1b[33mthe repo root has no package.json — nothing is installable at the top level\x1b[0m')
+    }
+
+    // Each package gets its own manifest summary: showing one arbitrary
+    // package's detail would be worse than showing none.
+    L.push('')
+    L.push('  --- per-package detail ---')
+    for (const p of r.packages) {
+      L.push(`    ${p.root === '' ? '.' : `${p.root}/`}`)
+      if (!p.hasManifest) {
+        L.push(`      \x1b[33mno package.json — nothing is installable here\x1b[0m`)
+        continue
+      }
+      const deps = p.dependencies
+        ? Object.entries(p.dependencies).map(([k, v]) => `${k}@${v}`).join(', ')
+        : 'none'
+      L.push(`      ${p.name ?? '?'}@${p.version ?? '?'}   type=${p.type ?? 'commonjs'}   deps=${deps}`)
+      if (p.installScripts.length) {
+        L.push(`      \x1b[1m\x1b[31m▲ install-time scripts: ${p.installScripts.map(s => s.key).join(', ')}\x1b[0m`)
+        for (const s of p.installScripts) L.push(`          ${s.key}: ${s.command}`)
+      } else {
+        L.push('      install scripts: none — nothing runs at install time')
+      }
+      if (p.dshBundlePatch) {
+        L.push(`      bundle patch: ${p.dshBundlePatch}`)
+        for (const f of p.policyFindings) L.push(`      \x1b[1m\x1b[31m▲ ${f}\x1b[0m`)
+        if (!p.policyFindings.length) L.push('        no harness policy rows touched')
+      } else {
+        L.push('      no `dsh.bundle.patch` — installs as a plain dependency')
+      }
+      if (p.entryMissingApply) L.push('      \x1b[33mdeclared entry does not export `apply` — not a cordis plugin\x1b[0m')
     }
   }
 
-  L.push(section('DSH bundle wiring'))
-  if (!r.dshBundlePatch) {
-    L.push('  no `dsh.bundle.patch` declaration.')
-    L.push('  Consequence: this package is installed as a plain dependency and never joins the')
-    L.push('  profile layer stack. DSH warns about exactly this. It only matters if something')
-    L.push('  imports it directly.')
-  } else {
-    L.push(`  dsh.bundle.patch: ${r.dshBundlePatch}`)
-    const patch = r.patch
-    if (!patch) {
-      L.push(`  \x1b[1m\x1b[31m  ▲ declared patch file is missing from the package\x1b[0m`)
+  if (!multi) {
+    L.push(section('package'))
+    if (!r.pkg) {
+      L.push('  \x1b[33mno package.json at the repository root — this is not an installable package\x1b[0m')
     } else {
-      L.push('  --- targeted overrides (patches an existing loader row) ---')
-      if (patch.targeted.length === 0) L.push('      none')
-      for (const t of patch.targeted) {
-        const watch = WATCH_ROWS.has(t.id)
-        L.push(`      ${watch ? '\x1b[1m\x1b[31m▲\x1b[0m' : ' '} line ${t.line}: id=${t.id}${t.disabled ? ' \x1b[1m(disabled: true)\x1b[0m' : ''}${watch ? '   <- harness policy row' : ''}`)
+      const p = r.pkg
+      L.push(`  name/version   : ${p.name ?? '?'} @ ${p.version ?? '?'}`)
+      L.push(`  license        : ${p.license ?? 'none declared'}`)
+      L.push(`  type           : ${p.type ?? 'commonjs'}`)
+      L.push(`  main/exports   : ${p.main ?? '-'} / ${p.exports ? JSON.stringify(p.exports).slice(0, 90) : '-'}`)
+      L.push(`  engines        : ${p.engines ? JSON.stringify(p.engines) : '-'}`)
+      L.push(`  dependencies   : ${p.dependencies ? Object.entries(p.dependencies).map(([k, v]) => `${k}@${v}`).join(', ') : 'none'}`)
+      if (r.entryMissingApply) L.push('  \x1b[33mdeclared entry does not export `apply` — not a cordis plugin\x1b[0m')
+
+      const scripts = p.scripts ?? {}
+      const risky = ['preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublishOnly'].filter(k => scripts[k])
+      L.push(`  scripts        : ${Object.keys(scripts).length ? Object.keys(scripts).join(', ') : 'none'}`)
+      if (risky.length) {
+        L.push(`  \x1b[1m\x1b[31m  ▲ install-time scripts present: ${risky.join(', ')}\x1b[0m`)
+        L.push('      pnpm >= 10 blocks dependency build scripts until you allowlist them in')
+        L.push('      pnpm-workspace.yaml (allowBuilds). Do not allowlist before reading them:')
+        for (const k of risky) L.push(`        ${k}: ${scripts[k]}`)
+      } else {
+        L.push('  install scripts: none — nothing runs at install time')
       }
-      L.push('  --- inserted rows (new plugins mounted into the tree) ---')
-      if (patch.inserted.length === 0) L.push('      none')
-      for (const t of patch.inserted) {
-        const watch = t.name && WATCH_ROWS.has(t.name)
-        L.push(`      ${watch ? '\x1b[1m\x1b[31m▲\x1b[0m' : ' '} line ${t.line}: id=${t.id}${t.name ? ` name=${t.name}` : ''}${watch ? '   <- harness policy row' : ''}`)
+    }
+  }
+
+  // In a monorepo the per-package wiring above is the real answer; a
+  // repo-level view here would describe a root package that may not exist.
+  if (!multi) {
+    L.push(section('DSH bundle wiring'))
+    if (!r.dshBundlePatch) {
+      L.push('  no `dsh.bundle.patch` declaration.')
+      L.push('  Consequence: this package is installed as a plain dependency and never joins the')
+      L.push('  profile layer stack. DSH warns about exactly this. It only matters if something')
+      L.push('  imports it directly.')
+    } else {
+      L.push(`  dsh.bundle.patch: ${r.dshBundlePatch}`)
+      const patch = r.patch
+      if (!patch) {
+        L.push(`  \x1b[1m\x1b[31m  ▲ declared patch file is missing from the package\x1b[0m`)
+      } else {
+        L.push('  --- targeted overrides (patches an existing loader row) ---')
+        if (patch.targeted.length === 0) L.push('      none')
+        for (const t of patch.targeted) {
+          const watch = WATCH_ROWS.has(t.id)
+          L.push(`      ${watch ? '\x1b[1m\x1b[31m▲\x1b[0m' : ' '} line ${t.line}: id=${t.id}${t.disabled ? ' \x1b[1m(disabled: true)\x1b[0m' : ''}${watch ? '   <- harness policy row' : ''}`)
+        }
+        L.push('  --- inserted rows (new plugins mounted into the tree) ---')
+        if (patch.inserted.length === 0) L.push('      none')
+        for (const t of patch.inserted) {
+          const watch = t.name && WATCH_ROWS.has(t.name)
+          L.push(`      ${watch ? '\x1b[1m\x1b[31m▲\x1b[0m' : ' '} line ${t.line}: id=${t.id}${t.name ? ` name=${t.name}` : ''}${watch ? '   <- harness policy row' : ''}`)
+        }
+        if (patch.jsExpressions.length) {
+          L.push('  --- !!js expressions (evaluated at config load) ---')
+          for (const j of patch.jsExpressions) L.push(`      \x1b[1m\x1b[31m▲\x1b[0m line ${j.line}: ${j.text.slice(0, 100)}`)
+        }
+        L.push('  (textual scan, not a YAML parse — read the file itself before trusting it)')
       }
-      if (patch.jsExpressions.length) {
-        L.push('  --- !!js expressions (evaluated at config load) ---')
-        for (const j of patch.jsExpressions) L.push(`      \x1b[1m\x1b[31m▲\x1b[0m line ${j.line}: ${j.text.slice(0, 100)}`)
-      }
-      L.push('  (textual scan, not a YAML parse — read the file itself before trusting it)')
     }
   }
 
   L.push(section('what actually gets installed'))
-  L.push(`  ${r.shipped.length} of ${r.fileCount} extracted files ship (package.json \`files\` field)`)
+  if (multi) {
+    const installable = r.packages.filter(p => p.hasManifest && p.shippedCount > 0).length
+    L.push(`  ${r.shipped.length} files ship in total, across ${installable} installable package(s).`)
+    L.push('  Per-package counts are in the `packages` table above.')
+  } else {
+    L.push(`  ${r.shipped.length} of ${r.fileCount} extracted files ship (package.json \`files\` field)`)
+  }
   for (const f of r.shipped.slice(0, 40)) {
     const mark = CODE_EXT.has(extname(f.path).toLowerCase()) ? ' ' : '·'
     L.push(`   ${mark} ${f.path}  ${String(f.size).padStart(7)} B  ${f.sha.slice(0, 16)}`)
@@ -529,16 +690,25 @@ async function main() {
       writeFileSync(target, f.data)
     }
 
-    const rootPkg = files.find(f => f.path === 'package.json')
-    let pkg = null
-    if (rootPkg) { try { pkg = JSON.parse(rootPkg.data.toString('utf8')) } catch { pkg = null } }
+    // A repo may hold one package at the root, one package in a subdirectory,
+    // or several side by side. Vet each as its own installable unit — vetting
+    // only the root would report "the whole repo ships" for a monorepo whose
+    // real packages are the subdirectories.
+    const packages = discoverPackageRoots(files).map(root => analyzePackage(root, files))
 
-    const patchRel = pkg?.dsh?.bundle?.patch ?? null
-    const patchFile = patchRel
-      ? files.find(f => f.path === String(patchRel).replace(/^\.\//, ''))
-      : null
+    const ownerOf = (path) => {
+      let best = null
+      for (const p of packages) {
+        if (p.root === '' || path.startsWith(p.prefix)) {
+          if (!best || p.prefix.length > best.prefix.length) best = p
+        }
+      }
+      return best
+    }
+    const shipsAnywhere = (path) => packages.some(p => p.shipped.has(path))
 
-    const shippedSet = shippedPaths(files.map(f => f.path), pkg?.files)
+    const primary = packages.find(p => p.root === '') ?? packages[0] ?? null
+    const pkg = primary?.pkg ?? null
 
     const hits = []
     const envKeys = new Set()
@@ -547,44 +717,35 @@ async function main() {
       const text = f.data.toString('utf8')
       const fileHits = scanCode(text, f.path)
       // Findings in files that never ship are informational only.
-      const ships = shippedSet.has(f.path)
-      for (const h of fileHits) hits.push({ ...h, ships })
+      const ships = shipsAnywhere(f.path)
+      const owner = ownerOf(f.path)
+      for (const h of fileHits) hits.push({ ...h, ships, pkgRoot: owner?.root ?? null })
       if (CODE_EXT.has(extname(f.path).toLowerCase())) {
         for (const m of text.matchAll(/process\.env\.([A-Za-z_][A-Za-z0-9_]*)/g)) envKeys.add(m[1])
       }
     }
 
-    const policyFindings = []
-    let patch = null
-    if (patchFile) {
-      patch = analyzePatch(patchFile.data.toString('utf8'))
-      for (const t of patch.targeted) {
-        if (!WATCH_ROWS.has(t.id)) continue
-        policyFindings.push(t.disabled
-          ? `patch disables harness row \`${t.id}\` (line ${t.line})`
-          : `patch overrides harness row \`${t.id}\` (line ${t.line})`)
+    // Per-package rollup, so a monorepo report can say which package is which.
+    for (const p of packages) {
+      p.hitCounts = { high: 0, medium: 0, low: 0, info: 0 }
+      for (const h of hits) {
+        if (h.pkgRoot === p.root && h.ships) p.hitCounts[h.sev]++
       }
-      for (const t of patch.inserted) {
-        if (t.name && WATCH_ROWS.has(t.name)) policyFindings.push(`patch inserts a row named \`${t.name}\` (line ${t.line})`)
-      }
-      if (patch.jsExpressions.length) {
-        policyFindings.push(`${patch.jsExpressions.length} !!js expression(s) evaluated at config load`)
-      }
+      p.shippedFiles = [...p.shipped]
+        .map(path => files.find(f => f.path === path))
+        .filter(Boolean)
+        .map(f => ({ path: f.path, size: f.data.length, sha: sha256(f.data) }))
+        .sort((a, b) => a.path.localeCompare(b.path))
     }
 
-    let entryMissingApply = false
-    const mainRel = pkg?.main ?? (pkg?.exports?.['.'] ?? null)
-    if (typeof mainRel === 'string') {
-      const entry = files.find(f => f.path === String(mainRel).replace(/^\.\//, ''))
-      if (entry) {
-        const src = entry.data.toString('utf8')
-        entryMissingApply = !/export\s+(?:async\s+)?(?:function|const|let|var)\s+apply\b|module\.exports\s*=\s*\{[^}]*\bapply\b/.test(src)
-      }
-    }
+    const patch = primary?.patch ?? null
+    const patchRel = primary?.patchRel ?? null
+    const entryMissingApply = primary?.entryMissingApply ?? false
+    const policyFindings = packages.flatMap(p => p.policyFindings)
+    const installScripts = packages.flatMap(p => p.installScripts.map(s => ({ ...s, pkgRoot: p.root })))
 
-    const shipped = files
-      .filter(f => shippedSet.has(f.path))
-      .map(f => ({ path: f.path, size: f.data.length, sha: sha256(f.data) }))
+    const shipped = packages
+      .flatMap(p => p.shippedFiles)
       .sort((a, b) => a.path.localeCompare(b.path))
 
     const shippedNotInFiles = hits.filter(h => !h.ships).map(h => h.file)
@@ -596,8 +757,12 @@ async function main() {
     if (hits.some(h => h.ships && h.rule === 'prompt-surface' && CODE_EXT.has(extname(h.file).toLowerCase()))) {
       notes.push('modifies the system prompt: transitive power — it can direct the agent, not only run code itself')
     }
-    if (pkg && !Array.isArray(pkg.files)) {
-      notes.push('no `files` field: roughly the whole repository ships, including anything not meant for release')
+    for (const p of packages) {
+      if (p.pkg && !Array.isArray(p.pkg.files) && p.shipped.size) {
+        notes.push(p.root === ''
+          ? 'no `files` field: roughly the whole repository ships, including anything not meant for release'
+          : `${p.root}/: no \`files\` field — roughly the whole directory ships`)
+      }
     }
 
     const result = {
@@ -609,6 +774,25 @@ async function main() {
       dshBundlePatch: patchRel,
       patch,
       entryMissingApply,
+      packages: packages.map(p => ({
+        root: p.root,
+        hasManifest: Boolean(p.pkg),
+        name: p.pkg?.name ?? null,
+        version: p.pkg?.version ?? null,
+        type: p.pkg?.type ?? null,
+        dependencies: p.pkg?.dependencies ?? null,
+        scripts: p.pkg?.scripts ?? null,
+        memberCount: p.members.length,
+        shippedCount: p.shipped.size,
+        filesField: p.pkg ? (Array.isArray(p.pkg.files) ? p.pkg.files : null) : undefined,
+        dshBundlePatch: p.patchRel,
+        patch: p.patch,
+        installScripts: p.installScripts,
+        entryMissingApply: p.entryMissingApply,
+        policyFindings: p.policyFindings,
+        hitCounts: p.hitCounts,
+        shipped: p.shippedFiles,
+      })),
       shipped,
       shippedNotInFiles: [...new Set(shippedNotInFiles)],
       notes,
